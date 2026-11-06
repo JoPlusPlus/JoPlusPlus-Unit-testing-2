@@ -1,10 +1,11 @@
 ﻿namespace Simulation.Checkout.Tests;
 
+using AutoFixture;
+using Bogus;
 using Bogus.DataSets;
+using Castle.Core.Resource;
 using FluentAssertions;
-using NSubstitute;
-using NSubstitute.ExceptionExtensions;
-using NSubstitute.ReceivedExtensions;
+using Moq;
 using Simulation.Checkout.Application;
 using Simulation.Checkout.Application.Abstractions;
 using Simulation.Checkout.Domain;
@@ -22,8 +23,8 @@ public class CheckoutServiceTests
         IReadOnlyList<OrderItem> Items = new List<OrderItem>();
         var order = new Order { CustomerName = "a", CustomerEmail = "a@gmail.com", Id = Guid.NewGuid(), Items = Items };
 
-        var service = new CheckoutService(Substitute.For<IOrderRepository>(), Substitute.For<IInventoryService>(),
-            Substitute.For<INotificationService>());
+        var service = new CheckoutService(new Mock<IOrderRepository>().Object, new Mock<IInventoryService>().Object,
+            new Mock<INotificationService>().Object);
 
         // Act
         Func<Task> act =  () =>  service.CheckoutAsync(order);
@@ -34,13 +35,13 @@ public class CheckoutServiceTests
     }
     // TASK 1.2
     [Theory]
-    [InlineData("apple",0)]
-    [InlineData("orange",-1)]
+    [InlineData("apple", 0)]
+    [InlineData("orange", -1)]
     public async Task CheckoutAsync_InvalidQuantity_ShouldThrow(string name, int quantity)
     {
         // Arrange
-        var service = new CheckoutService(Substitute.For<IOrderRepository>(), Substitute.For<IInventoryService>(),
-            Substitute.For<INotificationService>());
+        var service = new CheckoutService(new Mock<IOrderRepository>().Object, new Mock<IInventoryService>().Object,
+            new Mock<INotificationService>().Object);
 
         var order = new Order
         {
@@ -62,19 +63,19 @@ public class CheckoutServiceTests
 
 
         // Act
-        Func <Task> act = () => service.CheckoutAsync(order);
+        Func<Task> act = () => service.CheckoutAsync(order);
 
 
         // Assert
-        await act.Should().ThrowAsync<InvalidQuantityException>(name);
+        await act.Should().ThrowAsync<InvalidQuantityException>().WithMessage($"*{name}*");
     }
     // TASK 1.3
     [Fact]
     public async Task CheckoutAsync_NegativePrice_ShouldThrow()
     {
         // Arrange
-        var service = new CheckoutService(Substitute.For<IOrderRepository>(), Substitute.For<IInventoryService>(),
-            Substitute.For<INotificationService>());
+        var service = new CheckoutService(new Mock<IOrderRepository>().Object, new Mock<IInventoryService>().Object,
+            new Mock<INotificationService>().Object);
 
         var order = new Order
         {
@@ -105,8 +106,13 @@ public class CheckoutServiceTests
     public async Task CheckoutAsync_ZeroPrice_ShouldNotThrow()
     {
         // Arrange
-        var service = new CheckoutService(Substitute.For<IOrderRepository>(), Substitute.For<IInventoryService>(),
-            Substitute.For<INotificationService>());
+        var inventory = new Mock<IInventoryService>();
+        inventory
+            .Setup(x => x.IsAvailableAsync(It.IsAny<Guid>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+
+        var service = new CheckoutService(new Mock<IOrderRepository>().Object, inventory.Object,
+            new Mock<INotificationService>().Object);
 
         var order = new Order
         {
@@ -126,11 +132,11 @@ public class CheckoutServiceTests
         };
 
         // Act
-        Func<Task> act = () => service.CheckoutAsync(order);
-
+        var receipt = await service.CheckoutAsync(order);
 
         // Assert
-        await act.Should().NotThrowAsync<InvalidPriceException>("apple");
+        receipt.Subtotal.Should().Be(0m);
+        receipt.Total.Should().Be(0m);
     }
     // TASK 1.5
 
@@ -146,11 +152,13 @@ public class CheckoutServiceTests
     public async Task CheckoutAsync_DiscountForSubTotal_ShouldBe(decimal subTotal, decimal discount)
     {
         // Arrange
-        var inventory = Substitute.For<IInventoryService>();
-            inventory.IsAvailableAsync(Arg.Any<Guid>(), Arg.Any<int>(), Arg.Any<CancellationToken>()).Returns(true);
+        var inventory = new Mock<IInventoryService>();
+        inventory
+            .Setup(x => x.IsAvailableAsync(It.IsAny<Guid>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
 
-        var service = new CheckoutService(Substitute.For<IOrderRepository>(), inventory,
-            Substitute.For<INotificationService>());
+        var service = new CheckoutService(new Mock<IOrderRepository>().Object, inventory.Object,
+            new Mock<INotificationService>().Object);
 
         var order = new Order
         {
@@ -191,11 +199,13 @@ public class CheckoutServiceTests
         int item2Quantity, decimal item2Price, decimal ExpectedSubtotal, decimal ExpectedDiscount, decimal ExpectedTotal)
     {
         // Arrange
-        var inventory = Substitute.For<IInventoryService>();
-        inventory.IsAvailableAsync(Arg.Any<Guid>(), Arg.Any<int>(), Arg.Any<CancellationToken>()).Returns(true);
+        var inventory = new Mock<IInventoryService>();
+        inventory
+            .Setup(x => x.IsAvailableAsync(It.IsAny<Guid>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
 
-        var service = new CheckoutService(Substitute.For<IOrderRepository>(), inventory,
-            Substitute.For<INotificationService>());
+        var service = new CheckoutService(new Mock<IOrderRepository>().Object, inventory.Object,
+            new Mock<INotificationService>().Object);
 
         var order = new Order
         {
@@ -230,6 +240,173 @@ public class CheckoutServiceTests
         receipt.Discount.Should().Be(ExpectedDiscount);
         receipt.Total.Should().Be(ExpectedTotal);
     }
+    // Task 2
+    [Fact]
+    public async Task CheckoutAsync_ValidOrderAndAllItemsInStock_SavesOrderAndSendsConfirmation()
+    {
+        // Arrange
+        var orderRepo = new Mock<IOrderRepository>();
+        var inventoryService = new Mock<IInventoryService>();
+        var notificationService = new Mock<INotificationService>();
 
+        inventoryService
+            .Setup(x => x.IsAvailableAsync(It.IsAny<Guid>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+
+        var service = new CheckoutService(orderRepo.Object, inventoryService.Object, notificationService.Object);
+
+        var order = new Order
+        {
+            CustomerName = "a",
+            CustomerEmail = "a@gmail.com",
+            Id = Guid.NewGuid(),
+            Items = new List<OrderItem>
+            {
+                new OrderItem { ProductName = "apple", Quantity = 2, ProductId = Guid.NewGuid(), UnitPrice = 10m },
+                new OrderItem { ProductName = "orange", Quantity = 1, ProductId = Guid.NewGuid(), UnitPrice = 5m }
+            }
+        };
+
+        // Act
+        var receipt = await service.CheckoutAsync(order);
+
+        // Assert
+        orderRepo.Verify(x => x.SaveAsync(order, It.IsAny<CancellationToken>()), Times.Once());
+        notificationService.Verify(x => x.SendOrderConfirmationAsync(receipt, It.IsAny<CancellationToken>()), Times.Once());
+    }
+    // TASK 2.2
+    [Fact]
+    public async Task CheckoutAsync_OneItemOutOfStock_ThrowsAndDoesNotSaveOrSend()
+    {
+        // Arrange
+        var orderRepo = new Mock<IOrderRepository>();
+        var inventoryService = new Mock<IInventoryService>();
+        var notificationService = new Mock<INotificationService>();
+
+        inventoryService
+            .Setup(x => x.IsAvailableAsync(It.IsAny<Guid>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+
+        var service = new CheckoutService(orderRepo.Object, inventoryService.Object, notificationService.Object);
+
+        var order = new Order
+        {
+            CustomerName = "a",
+            CustomerEmail = "a@gmail.com",
+            Id = Guid.NewGuid(),
+            Items = new List<OrderItem>
+            {
+                new OrderItem { ProductName = "apple", Quantity = 1, ProductId = Guid.NewGuid(), UnitPrice = 5m }
+            }
+        };
+
+        // Act
+        Func<Task> act = () => service.CheckoutAsync(order);
+
+        // Assert
+        await act.Should().ThrowAsync<InsufficientInventoryException>();
+        orderRepo.Verify(x => x.SaveAsync(It.IsAny<Order>(), It.IsAny<CancellationToken>()), Times.Never());
+        notificationService.Verify(x => x.SendOrderConfirmationAsync(It.IsAny<CheckoutReceipt>(), It.IsAny<CancellationToken>()), Times.Never());
+    }
+    // TASK 2.3
+    [Fact]
+    public async Task CheckoutAsync_OrderQuantityEqualZero_ThrowsAndDoesNotSaveOrSend()
+    {
+        // Arrange
+        var orderRepo = new Mock<IOrderRepository>();
+        var inventoryService = new Mock<IInventoryService>();
+        var notificationService = new Mock<INotificationService>();
+
+        inventoryService
+            .Setup(x => x.IsAvailableAsync(It.IsAny<Guid>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+
+        var service = new CheckoutService(orderRepo.Object, inventoryService.Object, notificationService.Object);
+
+        var appleGuid = Guid.NewGuid();
+
+        var order = new Order
+        {
+            CustomerName = "a",
+            CustomerEmail = "a@gmail.com",
+            Id = Guid.NewGuid(),
+            Items = new List<OrderItem>
+            {
+                new OrderItem { ProductName = "apple", Quantity = 0, ProductId = appleGuid, UnitPrice = 5m }
+            }
+        };
+
+        // Act
+        Func<Task> act = () => service.CheckoutAsync(order);
+
+        // Assert
+        await act.Should().ThrowAsync<InvalidQuantityException>();
+        orderRepo.Verify(x => x.SaveAsync(It.IsAny<Order>(), It.IsAny<CancellationToken>()), Times.Never());
+        inventoryService.Verify(x => x.IsAvailableAsync(appleGuid, 0), Times.Never);
+        notificationService.Verify(x => x.SendOrderConfirmationAsync(It.IsAny<CheckoutReceipt>(), It.IsAny<CancellationToken>()), Times.Never());
+    }
+    // Task 3.1
+    [Fact]
+    public async Task CheckoutAsync_ValidOrderQuantityAndPrice_CheckoutSucceeds()
+    {
+        // Arrange
+        var fixture = new Fixture();
+        var orderRepo = new Mock<IOrderRepository>();
+        var inventoryService = new Mock<IInventoryService>();
+        var notificationService = new Mock<INotificationService>();
+        inventoryService
+        .Setup(x => x.IsAvailableAsync(It.IsAny<Guid>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+        .ReturnsAsync(true);
+
+        fixture.Customize<OrderItem>(c => c
+            .With(i => i.Quantity, () => 1)    // quantity > 0
+            .With(i => i.UnitPrice, () => 0)); // price >= 0
+
+        var order = fixture.Create<Order>();
+        var service = new CheckoutService(orderRepo.Object, inventoryService.Object, notificationService.Object);
+
+        // Act
+        var receipt = await service.CheckoutAsync(order);
+
+        // Assert
+        receipt.Should().NotBeNull(); // if it returns the receipt , means it didnt fail or throw exception
+    }
+    // Task 3.2
+    [Fact]
+    public async Task CheckoutAsync_BogusCustomerWithFixedSeed_ReceiptShouldHaveSameNameAndEmail()
+    {
+        // Arrange
+        var faker = new Faker();
+        faker.Random = new Bogus.Randomizer(35);
+        var customerName = faker.Name.FullName();
+        var customerEmail = faker.Internet.Email();
+
+        var orderRepo = new Mock<IOrderRepository>();
+        var inventoryService = new Mock<IInventoryService>();
+        var notificationService = new Mock<INotificationService>();
+        inventoryService
+            .Setup(x => x.IsAvailableAsync(It.IsAny<Guid>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+
+        var service = new CheckoutService(orderRepo.Object, inventoryService.Object, notificationService.Object);
+
+        var order = new Order
+        {
+            CustomerName = customerName,
+            CustomerEmail = customerEmail,
+            Id = Guid.NewGuid(),
+            Items = new List<OrderItem>
+            {
+                new OrderItem { ProductName = "apple", Quantity = 1, ProductId = Guid.NewGuid(), UnitPrice = 10m }
+            }
+        };
+
+        // Act
+        var receipt = await service.CheckoutAsync(order);
+
+        // Assert
+        receipt.CustomerName.Should().Be(customerName);
+        receipt.CustomerEmail.Should().Be(customerEmail);
+    }
 
 }
